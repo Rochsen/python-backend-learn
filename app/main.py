@@ -3,12 +3,15 @@
 第 1 课：进程监听端口，并用 HTTP 返回 JSON。
 第 2 课：用 POST 创建送检批次。批次先放在内存列表里，进程重启后会消失。
 第 3 课：用 GET 查看全部记录，以及按编号查看一条。
+第 4 课：用 CSV 一次创建多条记录。
 """
 
+import csv
 from datetime import datetime
+from io import StringIO
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field, ValidationError
 
 app = FastAPI(
     title="LabAssist",
@@ -76,3 +79,23 @@ def get_batch(batch_id: int) -> Batch:
         if batch.id == batch_id:
             return batch
     raise HTTPException(status_code=404, detail="批次不存在")
+
+
+@app.post("/batches/import", status_code=201)
+async def import_batches(
+    file: UploadFile = File(description="UTF-8 CSV，表头：sample_id,sample_name,sample_type,org_name,accept_time"),
+) -> list[Batch]:
+    """按行创建记录。每一行使用和 POST /batches 相同的字段校验。"""
+    text = (await file.read()).decode("utf-8-sig")
+    reader = csv.DictReader(StringIO(text))
+    created: list[Batch] = []
+    for line_no, row in enumerate(reader, start=2):
+        try:
+            body = BatchCreate.model_validate(row)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"line": line_no, "errors": exc.errors()},
+            ) from exc
+        created.append(create_batch(body))
+    return created
