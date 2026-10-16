@@ -4,7 +4,7 @@
 第 2 课：用 POST 创建送检批次。批次先放在内存列表里，进程重启后会消失。
 """
 
-from datetime import date
+from datetime import datetime
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -18,10 +18,12 @@ app = FastAPI(
 
 class BatchCreate(BaseModel):
     """调用方提交的批次内容。编号和状态由服务端填写。"""
-
+    
+    sample_id: str = Field(min_length=1, max_length=20, description="样本编号")
+    sample_name: str = Field(min_length=1, max_length=100, description="样本名称")
+    sample_type: str = Field(min_length=1, max_length=100, description="样本类型")
     org_name: str = Field(min_length=1, max_length=100, description="送检单位")
-    sample_count: int = Field(ge=1, description="样本数")
-    tested_on: date = Field(description="检测日期，格式 YYYY-MM-DD")
+    accept_time: datetime = Field(description="接收时间，格式 YYYY-MM-DD HH:MM:SS")
 
 
 class Batch(BatchCreate):
@@ -49,9 +51,11 @@ def create_batch(body: BatchCreate) -> Batch:
     batch = Batch(
         id=_next_id,
         status="pending",
+        sample_id=body.sample_id,
+        sample_name=body.sample_name,
+        sample_type=body.sample_type,
         org_name=body.org_name,
-        sample_count=body.sample_count,
-        tested_on=body.tested_on,
+        accept_time=body.accept_time,
     )
     _next_id += 1
     batches.append(batch)
