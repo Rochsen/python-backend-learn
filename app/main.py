@@ -2,11 +2,12 @@
 
 第 1 课：进程监听端口，并用 HTTP 返回 JSON。
 第 2 课：用 POST 创建送检批次。批次先放在内存列表里，进程重启后会消失。
+第 3 课：用 GET 查看全部记录，以及按编号查看一条。
 """
 
 from datetime import datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 app = FastAPI(
@@ -60,3 +61,18 @@ def create_batch(body: BatchCreate) -> Batch:
     _next_id += 1
     batches.append(batch)
     return batch
+
+
+@app.get("/batches")
+def list_batches() -> list[Batch]:
+    """返回当前进程里保存的全部记录。"""
+    return batches
+
+
+@app.get("/batches/{batch_id}")
+def get_batch(batch_id: int) -> Batch:
+    """按编号返回一条记录。编号不存在时返回 404。"""
+    for batch in batches:
+        if batch.id == batch_id:
+            return batch
+    raise HTTPException(status_code=404, detail="批次不存在")
