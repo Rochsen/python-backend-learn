@@ -4,6 +4,7 @@
 第 2 课：用 POST 创建送检批次。批次先放在内存列表里，进程重启后会消失。
 第 3 课：用 GET 查看全部记录，以及按编号查看一条。
 第 4 课：用 CSV 一次创建多条记录。
+第 5 课：记录写入 SQLite，重启服务后仍然在。
 """
 
 import csv
@@ -12,6 +13,8 @@ from io import StringIO
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import DateTime, String, create_engine, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 app = FastAPI(
     title="LabAssist",
@@ -37,9 +40,39 @@ class Batch(BatchCreate):
     status: str
 
 
-# 进程内存中的批次。重启服务后这份列表会清空，第 2 周再换成数据库。
-batches: list[Batch] = []
-_next_id = 1
+class Base(DeclarativeBase):
+    pass
+
+
+class BatchRecord(Base):
+    """批次在 SQLite 中的一行。"""
+
+    __tablename__ = "batches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(String(20))
+    sample_id: Mapped[str] = mapped_column(String(20))
+    sample_name: Mapped[str] = mapped_column(String(100))
+    sample_type: Mapped[str] = mapped_column(String(100))
+    org_name: Mapped[str] = mapped_column(String(100))
+    accept_time: Mapped[datetime] = mapped_column(DateTime)
+
+
+engine = create_engine("sqlite:///labassist.db")
+Base.metadata.create_all(engine)
+
+
+def _to_batch(record: BatchRecord) -> Batch:
+    """把数据库行转成接口返回的模型。"""
+    return Batch(
+        id=record.id,
+        status=record.status,
+        sample_id=record.sample_id,
+        sample_name=record.sample_name,
+        sample_type=record.sample_type,
+        org_name=record.org_name,
+        accept_time=record.accept_time,
+    )
 
 
 @app.get("/health")
@@ -51,9 +84,7 @@ def health() -> dict[str, str]:
 @app.post("/batches", status_code=201)
 def create_batch(body: BatchCreate) -> Batch:
     """创建一条送检批次，并分配自增编号。"""
-    global _next_id
-    batch = Batch(
-        id=_next_id,
+    record = BatchRecord(
         status="pending",
         sample_id=body.sample_id,
         sample_name=body.sample_name,
@@ -61,24 +92,29 @@ def create_batch(body: BatchCreate) -> Batch:
         org_name=body.org_name,
         accept_time=body.accept_time,
     )
-    _next_id += 1
-    batches.append(batch)
-    return batch
+    with Session(engine) as session:
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return _to_batch(record)
 
 
 @app.get("/batches")
 def list_batches() -> list[Batch]:
-    """返回当前进程里保存的全部记录。"""
-    return batches
+    """返回数据库里保存的全部记录。"""
+    with Session(engine) as session:
+        records = session.scalars(select(BatchRecord).order_by(BatchRecord.id)).all()
+        return [_to_batch(record) for record in records]
 
 
 @app.get("/batches/{batch_id}")
 def get_batch(batch_id: int) -> Batch:
     """按编号返回一条记录。编号不存在时返回 404。"""
-    for batch in batches:
-        if batch.id == batch_id:
-            return batch
-    raise HTTPException(status_code=404, detail="批次不存在")
+    with Session(engine) as session:
+        record = session.get(BatchRecord, batch_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="批次不存在")
+        return _to_batch(record)
 
 
 @app.post("/batches/import", status_code=201)
