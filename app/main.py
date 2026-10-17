@@ -33,8 +33,8 @@ class BatchCreate(BaseModel):
     accept_time: datetime = Field(description="接收时间，格式 YYYY-MM-DD HH:MM:SS")
 
 
-class Batch(BatchCreate):
-    """已经保存的批次。"""
+class BatchOut(BatchCreate):
+    """Schema：接口返回的批次。"""
 
     id: int
     status: str
@@ -44,8 +44,8 @@ class Base(DeclarativeBase):
     pass
 
 
-class BatchRecord(Base):
-    """批次在 SQLite 中的一行。"""
+class Batch(Base):
+    """数据库表 batches。"""
 
     __tablename__ = "batches"
 
@@ -62,9 +62,9 @@ engine = create_engine("sqlite:///labassist.db")
 Base.metadata.create_all(engine)
 
 
-def _to_batch(record: BatchRecord) -> Batch:
-    """把数据库行转成接口返回的模型。"""
-    return Batch(
+def _to_batch(record: Batch) -> BatchOut:
+    """把数据库行转成接口响应的 schema。"""
+    return BatchOut(
         id=record.id,
         status=record.status,
         sample_id=record.sample_id,
@@ -82,9 +82,9 @@ def health() -> dict[str, str]:
 
 
 @app.post("/batches", status_code=201)
-def create_batch(body: BatchCreate) -> Batch:
+def create_batch(body: BatchCreate) -> BatchOut:
     """创建一条送检批次，并分配自增编号。"""
-    record = BatchRecord(
+    record = Batch(
         status="pending",
         sample_id=body.sample_id,
         sample_name=body.sample_name,
@@ -100,18 +100,18 @@ def create_batch(body: BatchCreate) -> Batch:
 
 
 @app.get("/batches")
-def list_batches() -> list[Batch]:
+def list_batches() -> list[BatchOut]:
     """返回数据库里保存的全部记录。"""
     with Session(engine) as session:
-        records = session.scalars(select(BatchRecord).order_by(BatchRecord.id)).all()
+        records = session.scalars(select(Batch).order_by(Batch.id)).all()
         return [_to_batch(record) for record in records]
 
 
 @app.get("/batches/{batch_id}")
-def get_batch(batch_id: int) -> Batch:
+def get_batch(batch_id: int) -> BatchOut:
     """按编号返回一条记录。编号不存在时返回 404。"""
     with Session(engine) as session:
-        record = session.get(BatchRecord, batch_id)
+        record = session.get(Batch, batch_id)
         if record is None:
             raise HTTPException(status_code=404, detail="批次不存在")
         return _to_batch(record)
@@ -120,11 +120,11 @@ def get_batch(batch_id: int) -> Batch:
 @app.post("/batches/import", status_code=201)
 async def import_batches(
     file: UploadFile = File(description="UTF-8 CSV，表头：sample_id,sample_name,sample_type,org_name,accept_time"),
-) -> list[Batch]:
+) -> list[BatchOut]:
     """按行创建记录。每一行使用和 POST /batches 相同的字段校验。"""
     text = (await file.read()).decode("utf-8-sig")
     reader = csv.DictReader(StringIO(text))
-    created: list[Batch] = []
+    created: list[BatchOut] = []
     for line_no, row in enumerate(reader, start=2):
         try:
             body = BatchCreate.model_validate(row)
