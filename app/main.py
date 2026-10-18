@@ -7,6 +7,7 @@
 第 5 课：记录写入 SQLite，重启服务后仍然在。
 第 6 课：注册用户。密码只存摘要，重复用户名会被拒绝。
 第 7 课：登录。正确密码返回 JWT，错误密码返回 401。
+第 8 课：批次接口必须登录。用户只能看到自己的记录。
 """
 
 import csv
@@ -16,9 +17,11 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 
 import jwt
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import DateTime, String, create_engine, select
+from sqlalchemy import DateTime, ForeignKey, String, create_engine, inspect, select
+from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
@@ -44,6 +47,7 @@ class BatchOut(BatchCreate):
 
     id: int
     status: str
+    user_id: int | None
 
 
 class Base(DeclarativeBase):
@@ -57,6 +61,7 @@ class Batch(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     status: Mapped[str] = mapped_column(String(20))
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     sample_id: Mapped[str] = mapped_column(String(20))
     sample_name: Mapped[str] = mapped_column(String(100))
     sample_type: Mapped[str] = mapped_column(String(100))
@@ -111,11 +116,46 @@ engine = create_engine("sqlite:///labassist.db")
 Base.metadata.create_all(engine)
 
 
+def _ensure_batch_user_id() -> None:
+    """给已有的 batches 表补上 user_id。create_all 不会修改已经存在的表。"""
+    columns = {column["name"] for column in inspect(engine).get_columns("batches")}
+    if "user_id" not in columns:
+        with engine.begin() as connection:
+            connection.execute(sql_text("ALTER TABLE batches ADD COLUMN user_id INTEGER"))
+
+
+_ensure_batch_user_id()
+
+# 缺少令牌时自己返回 401。HTTPBearer 默认会返回 403。
+_bearer = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> UserOut:
+    """从 Authorization 头里的 JWT 找出当前用户。没有或无效时返回 401。"""
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="未登录")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="登录已失效") from None
+    username = payload.get("sub")
+    if not isinstance(username, str):
+        raise HTTPException(status_code=401, detail="登录已失效")
+    with Session(engine) as session:
+        record = session.scalar(select(User).where(User.username == username))
+        if record is None:
+            raise HTTPException(status_code=401, detail="登录已失效")
+        return UserOut(id=record.id, username=record.username)
+
+
 def _to_batch(record: Batch) -> BatchOut:
     """把数据库行转成接口响应的 schema。"""
     return BatchOut(
         id=record.id,
         status=record.status,
+        user_id=record.user_id,
         sample_id=record.sample_id,
         sample_name=record.sample_name,
         sample_type=record.sample_type,
@@ -131,10 +171,11 @@ def health() -> dict[str, str]:
 
 
 @app.post("/batches", status_code=201)
-def create_batch(body: BatchCreate) -> BatchOut:
-    """创建一条送检批次，并分配自增编号。"""
+def create_batch(body: BatchCreate, user: UserOut = Depends(get_current_user)) -> BatchOut:
+    """创建一条送检批次，并分配自增编号。记录归当前登录用户所有。"""
     record = Batch(
         status="pending",
+        user_id=user.id,
         sample_id=body.sample_id,
         sample_name=body.sample_name,
         sample_type=body.sample_type,
@@ -149,19 +190,21 @@ def create_batch(body: BatchCreate) -> BatchOut:
 
 
 @app.get("/batches")
-def list_batches() -> list[BatchOut]:
-    """返回数据库里保存的全部记录。"""
+def list_batches(user: UserOut = Depends(get_current_user)) -> list[BatchOut]:
+    """返回当前用户自己的记录。"""
     with Session(engine) as session:
-        records = session.scalars(select(Batch).order_by(Batch.id)).all()
+        records = session.scalars(
+            select(Batch).where(Batch.user_id == user.id).order_by(Batch.id)
+        ).all()
         return [_to_batch(record) for record in records]
 
 
 @app.get("/batches/{batch_id}")
-def get_batch(batch_id: int) -> BatchOut:
-    """按编号返回一条记录。编号不存在时返回 404。"""
+def get_batch(batch_id: int, user: UserOut = Depends(get_current_user)) -> BatchOut:
+    """按编号返回一条记录。编号不存在或不属于当前用户时返回 404。"""
     with Session(engine) as session:
         record = session.get(Batch, batch_id)
-        if record is None:
+        if record is None or record.user_id != user.id:
             raise HTTPException(status_code=404, detail="批次不存在")
         return _to_batch(record)
 
@@ -169,6 +212,7 @@ def get_batch(batch_id: int) -> BatchOut:
 @app.post("/batches/import", status_code=201)
 async def import_batches(
     file: UploadFile = File(description="UTF-8 CSV，表头：sample_id,sample_name,sample_type,org_name,accept_time"),
+    user: UserOut = Depends(get_current_user),
 ) -> list[BatchOut]:
     """按行创建记录。每一行使用和 POST /batches 相同的字段校验。"""
     text = (await file.read()).decode("utf-8-sig")
@@ -182,7 +226,7 @@ async def import_batches(
                 status_code=422,
                 detail={"line": line_no, "errors": exc.errors()},
             ) from exc
-        created.append(create_batch(body))
+        created.append(create_batch(body, user))
     return created
 
 
