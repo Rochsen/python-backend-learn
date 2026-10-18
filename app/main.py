@@ -8,19 +8,23 @@
 第 6 课：注册用户。密码只存摘要，重复用户名会被拒绝。
 第 7 课：登录。正确密码返回 JWT，错误密码返回 401。
 第 8 课：批次接口必须登录。用户只能看到自己的记录。
+第 10 课：对话发给模型后写入数据库，重启服务后仍然在。
 """
 
 import csv
 import hashlib
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 
 import jwt
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import DateTime, ForeignKey, String, create_engine, inspect, select
+from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, inspect, select
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
@@ -79,6 +83,18 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(200))
 
 
+class Message(Base):
+    """数据库表 messages。一条记录是用户或助手说的一句话。"""
+
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
 class UserCreate(BaseModel):
     """Schema：注册请求体。"""
 
@@ -107,9 +123,26 @@ class TokenOut(BaseModel):
     token_type: str
 
 
+class ChatCreate(BaseModel):
+    """Schema：发给模型的一句话。"""
+
+    content: str = Field(min_length=1, max_length=2000, description="用户说的话")
+
+
+class MessageOut(BaseModel):
+    """Schema：已经保存的一条对话。"""
+
+    id: int
+    role: str
+    content: str
+
+
 # 第 7 课把签名密钥放在代码里，用来签发和校验 JWT。
 JWT_SECRET = "labassist-lesson-7"
 JWT_ALGORITHM = "HS256"
+SYSTEM_PROMPT = "你是实验室文档助手，用简短中文回答。"
+
+load_dotenv()
 
 
 engine = create_engine("sqlite:///labassist.db")
@@ -276,3 +309,70 @@ def login(body: Login) -> TokenOut:
         if record is None or not _verify_password(body.password, record.password_hash):
             raise HTTPException(status_code=401, detail="用户名或密码错误")
         return TokenOut(access_token=_create_access_token(record.username), token_type="bearer")
+
+
+def _model_setting(name: str) -> str:
+    """读取模型配置。没填时返回 500，避免把空密钥发给接口。"""
+    value = os.environ.get(name, "")
+    if not value:
+        raise HTTPException(status_code=500, detail=f"缺少环境变量 {name}")
+    return value
+
+
+def _ask_model(messages: list[dict[str, str]]) -> str:
+    """把对话发给 OpenAI 兼容接口，返回助手的文字。"""
+    client = OpenAI(
+        api_key=_model_setting("OPENAI_API_KEY"),
+        base_url=_model_setting("OPENAI_BASE_URL"),
+        max_retries=0,
+    )
+    completion = client.chat.completions.create(
+        model=_model_setting("OPENAI_MODEL"),
+        messages=messages,
+    )
+    content = completion.choices[0].message.content
+    if not content:
+        raise HTTPException(status_code=502, detail="模型没有返回文字")
+    return content
+
+
+def _to_message(record: Message) -> MessageOut:
+    """把数据库行转成接口响应的 schema。"""
+    return MessageOut(id=record.id, role=record.role, content=record.content)
+
+
+@app.post("/chat")
+def chat(body: ChatCreate, user: UserOut = Depends(get_current_user)) -> MessageOut:
+    """保存用户的话和模型的回复。两次写入在同一次提交里完成。"""
+    with Session(engine) as session:
+        history = session.scalars(
+            select(Message).where(Message.user_id == user.id).order_by(Message.id)
+        ).all()
+        previous = [{"role": record.role, "content": record.content} for record in history]
+    reply = _ask_model(
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *previous,
+            {"role": "user", "content": body.content},
+        ]
+    )
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            Message(user_id=user.id, role="user", content=body.content, created_at=now)
+        )
+        assistant = Message(user_id=user.id, role="assistant", content=reply, created_at=now)
+        session.add(assistant)
+        session.commit()
+        session.refresh(assistant)
+        return _to_message(assistant)
+
+
+@app.get("/messages")
+def list_messages(user: UserOut = Depends(get_current_user)) -> list[MessageOut]:
+    """返回当前用户的全部对话。记录在数据库里，重启服务后仍然在。"""
+    with Session(engine) as session:
+        records = session.scalars(
+            select(Message).where(Message.user_id == user.id).order_by(Message.id)
+        ).all()
+        return [_to_message(record) for record in records]
