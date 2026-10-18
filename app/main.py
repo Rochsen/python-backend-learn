@@ -9,10 +9,12 @@
 第 7 课：登录。正确密码返回 JWT，错误密码返回 401。
 第 8 课：批次接口必须登录。用户只能看到自己的记录。
 第 10 课：对话发给模型后写入数据库，重启服务后仍然在。
+第 11 课：/chat 用 SSE 逐段返回文字，结束后仍写入数据库。
 """
 
 import csv
 import hashlib
+import json
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -21,8 +23,10 @@ from io import StringIO
 import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, inspect, select
 from sqlalchemy import text as sql_text
@@ -319,14 +323,25 @@ def _model_setting(name: str) -> str:
     return value
 
 
-def _ask_model(messages: list[dict[str, str]]) -> str:
-    """把对话发给 OpenAI 兼容接口，返回助手的文字。"""
-    client = OpenAI(
+def _model_client() -> OpenAI:
+    """按环境变量创建 OpenAI 兼容客户端。"""
+    return OpenAI(
         api_key=_model_setting("OPENAI_API_KEY"),
         base_url=_model_setting("OPENAI_BASE_URL"),
         max_retries=0,
     )
-    completion = client.chat.completions.create(
+
+
+def _stored_message(role: str, content: str) -> ChatCompletionMessageParam:
+    """把数据库里的角色收成模型接受的 user 或 assistant。"""
+    if role == "assistant":
+        return {"role": "assistant", "content": content}
+    return {"role": "user", "content": content}
+
+
+def _ask_model(messages: list[ChatCompletionMessageParam]) -> str:
+    """把对话发给 OpenAI 兼容接口，返回助手的文字。"""
+    completion = _model_client().chat.completions.create(
         model=_model_setting("OPENAI_MODEL"),
         messages=messages,
     )
@@ -336,36 +351,55 @@ def _ask_model(messages: list[dict[str, str]]) -> str:
     return content
 
 
+def _stream_model(messages: list[ChatCompletionMessageParam]):
+    """逐段取出模型返回的文字。没有文字的片段会被跳过。"""
+    stream = _model_client().chat.completions.create(
+        model=_model_setting("OPENAI_MODEL"),
+        messages=messages,
+        stream=True,
+    )
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+
 def _to_message(record: Message) -> MessageOut:
     """把数据库行转成接口响应的 schema。"""
     return MessageOut(id=record.id, role=record.role, content=record.content)
 
 
 @app.post("/chat")
-def chat(body: ChatCreate, user: UserOut = Depends(get_current_user)) -> MessageOut:
-    """保存用户的话和模型的回复。两次写入在同一次提交里完成。"""
+def chat(body: ChatCreate, user: UserOut = Depends(get_current_user)) -> StreamingResponse:
+    """按 SSE 逐段返回模型的文字。全部片段到齐后，仍把双方的话一次写入数据库。"""
     with Session(engine) as session:
         history = session.scalars(
             select(Message).where(Message.user_id == user.id).order_by(Message.id)
         ).all()
-        previous = [{"role": record.role, "content": record.content} for record in history]
-    reply = _ask_model(
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *previous,
-            {"role": "user", "content": body.content},
-        ]
-    )
-    now = datetime.now(timezone.utc)
-    with Session(engine) as session:
-        session.add(
-            Message(user_id=user.id, role="user", content=body.content, created_at=now)
-        )
-        assistant = Message(user_id=user.id, role="assistant", content=reply, created_at=now)
-        session.add(assistant)
-        session.commit()
-        session.refresh(assistant)
-        return _to_message(assistant)
+        previous = [_stored_message(record.role, record.content) for record in history]
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *previous,
+        {"role": "user", "content": body.content},
+    ]
+
+    def events():
+        parts: list[str] = []
+        for delta in _stream_model(messages):
+            parts.append(delta)
+            yield f"data: {json.dumps(delta, ensure_ascii=False)}\n\n"
+        reply = "".join(parts)
+        if not reply:
+            return
+        now = datetime.now(timezone.utc)
+        with Session(engine) as session:
+            session.add(Message(user_id=user.id, role="user", content=body.content, created_at=now))
+            session.add(Message(user_id=user.id, role="assistant", content=reply, created_at=now))
+            session.commit()
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 @app.get("/messages")
