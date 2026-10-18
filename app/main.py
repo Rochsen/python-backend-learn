@@ -5,15 +5,19 @@
 第 3 课：用 GET 查看全部记录，以及按编号查看一条。
 第 4 课：用 CSV 一次创建多条记录。
 第 5 课：记录写入 SQLite，重启服务后仍然在。
+第 6 课：注册用户。密码只存摘要，重复用户名会被拒绝。
 """
 
 import csv
+import hashlib
+import secrets
 from datetime import datetime
 from io import StringIO
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import DateTime, String, create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 app = FastAPI(
@@ -24,8 +28,8 @@ app = FastAPI(
 
 
 class BatchCreate(BaseModel):
-    """调用方提交的批次内容。编号和状态由服务端填写。"""
-    
+    """Schema：创建批次的请求体。编号和状态由服务端填写。"""
+
     sample_id: str = Field(min_length=1, max_length=20, description="样本编号")
     sample_name: str = Field(min_length=1, max_length=100, description="样本名称")
     sample_type: str = Field(min_length=1, max_length=100, description="样本类型")
@@ -56,6 +60,30 @@ class Batch(Base):
     sample_type: Mapped[str] = mapped_column(String(100))
     org_name: Mapped[str] = mapped_column(String(100))
     accept_time: Mapped[datetime] = mapped_column(DateTime)
+
+
+class User(Base):
+    """数据库表 users。password_hash 是密码摘要，不是原密码。"""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(50), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(200))
+
+
+class UserCreate(BaseModel):
+    """Schema：注册请求体。"""
+
+    username: str = Field(min_length=1, max_length=50, description="用户名")
+    password: str = Field(min_length=6, max_length=100, description="密码，至少 6 位")
+
+
+class UserOut(BaseModel):
+    """Schema：注册成功的响应，不包含密码。"""
+
+    id: int
+    username: str
 
 
 engine = create_engine("sqlite:///labassist.db")
@@ -135,3 +163,25 @@ async def import_batches(
             ) from exc
         created.append(create_batch(body))
     return created
+
+
+def _hash_password(password: str) -> str:
+    """用随机盐和 PBKDF2 生成密码摘要。"""
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
+    return f"{salt}${digest.hex()}"
+
+
+@app.post("/users", status_code=201)
+def register(body: UserCreate) -> UserOut:
+    """注册用户。用户名已存在时返回 409。"""
+    record = User(username=body.username, password_hash=_hash_password(body.password))
+    with Session(engine) as session:
+        session.add(record)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            raise HTTPException(status_code=409, detail="用户名已存在") from None
+        session.refresh(record)
+        return UserOut(id=record.id, username=record.username)
