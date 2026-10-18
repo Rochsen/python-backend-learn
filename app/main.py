@@ -6,14 +6,16 @@
 第 4 课：用 CSV 一次创建多条记录。
 第 5 课：记录写入 SQLite，重启服务后仍然在。
 第 6 课：注册用户。密码只存摘要，重复用户名会被拒绝。
+第 7 课：登录。正确密码返回 JWT，错误密码返回 401。
 """
 
 import csv
 import hashlib
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 
+import jwt
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import DateTime, String, create_engine, select
@@ -84,6 +86,25 @@ class UserOut(BaseModel):
 
     id: int
     username: str
+
+
+class Login(BaseModel):
+    """Schema：登录请求体。"""
+
+    username: str = Field(min_length=1, max_length=50, description="用户名")
+    password: str = Field(min_length=1, max_length=100, description="密码")
+
+
+class TokenOut(BaseModel):
+    """Schema：登录成功的响应。"""
+
+    access_token: str
+    token_type: str
+
+
+# 第 7 课把签名密钥放在代码里，用来签发和校验 JWT。
+JWT_SECRET = "labassist-lesson-7"
+JWT_ALGORITHM = "HS256"
 
 
 engine = create_engine("sqlite:///labassist.db")
@@ -185,3 +206,29 @@ def register(body: UserCreate) -> UserOut:
             raise HTTPException(status_code=409, detail="用户名已存在") from None
         session.refresh(record)
         return UserOut(id=record.id, username=record.username)
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    """用保存的盐重新计算摘要，并和数据库中的摘要比较。"""
+    salt, digest_hex = password_hash.split("$", 1)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
+    return secrets.compare_digest(digest.hex(), digest_hex)
+
+
+def _create_access_token(username: str) -> str:
+    """签发 2 小时有效的 JWT，sub 里放用户名。"""
+    payload = {
+        "sub": username,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=2),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+@app.post("/login")
+def login(body: Login) -> TokenOut:
+    """登录。用户名或密码错误时返回 401。"""
+    with Session(engine) as session:
+        record = session.scalar(select(User).where(User.username == body.username))
+        if record is None or not _verify_password(body.password, record.password_hash):
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+        return TokenOut(access_token=_create_access_token(record.username), token_type="bearer")
