@@ -12,6 +12,7 @@
 第 11 课：/chat 用 SSE 逐段返回文字，结束后仍写入数据库。
 第 12 课：质控描述解析成固定 JSON，并记下 token 用量。
 第 13 课：提问时模型调用查询工具，数字来自数据库。
+第 14 课：pandas 计算均值和异常数。计算失败时返回错误，不让模型编造数字。
 """
 
 import csv
@@ -24,6 +25,7 @@ from typing import Literal
 from io import StringIO
 
 import jwt
+import pandas as pd
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -206,6 +208,27 @@ class QuestionOut(QcCount):
     answer: str
 
 
+class MetricCreate(BaseModel):
+    """Schema：一组测量值和异常阈值。"""
+
+    content: str = Field(min_length=1, max_length=2000, description="要问的问题")
+    values: list[float] = Field(description="测量值。空列表会让计算工具失败")
+    threshold: float = Field(description="大于该值的测量值计为异常")
+
+
+class MetricStats(BaseModel):
+    """Schema：pandas 算出的均值和异常数。"""
+
+    mean: float
+    anomaly_count: int
+
+
+class MetricOut(MetricStats):
+    """Schema：模型的说明，以及 pandas 算出的数字。"""
+
+    answer: str
+
+
 # 第 7 课把签名密钥放在代码里，用来签发和校验 JWT。
 JWT_SECRET = "labassist-lesson-7"
 JWT_ALGORITHM = "HS256"
@@ -228,6 +251,17 @@ QC_COUNT_TOOL: ChatCompletionFunctionToolParam = {
     "function": {
         "name": "count_qc_reports",
         "description": "统计当前用户的质控记录数量，返回 total、pass_count、fail_count、review_count。",
+    },
+}
+METRIC_PROMPT = (
+    "你是实验室文档助手。回答测量值问题时必须调用 summarize_measurements。"
+    "数字只能使用工具返回的 mean 和 anomaly_count，并用简短中文说明。"
+)
+METRIC_TOOL: ChatCompletionFunctionToolParam = {
+    "type": "function",
+    "function": {
+        "name": "summarize_measurements",
+        "description": "用 pandas 计算测量值的均值，以及大于阈值的异常个数。",
     },
 }
 
@@ -655,3 +689,73 @@ def ask_question(body: QuestionCreate, user: UserOut = Depends(get_current_user)
         fail_count=count.fail_count,
         review_count=count.review_count,
     )
+
+
+def _summarize_measurements(values: list[float], threshold: float) -> MetricStats:
+    """用 pandas 计算均值，并数出大于阈值的异常值。"""
+    series = pd.Series(values, dtype="float64")
+    if series.empty or bool(series.isna().any()):
+        raise HTTPException(status_code=400, detail="没有可计算的数值")
+    return MetricStats(
+        mean=round(float(series.mean()), 2),
+        anomaly_count=int((series > threshold).sum()),
+    )
+
+
+def _ask_about_metrics(content: str, values: list[float], threshold: float) -> tuple[str, MetricStats]:
+    """先让模型调用计算工具。pandas 失败时直接返回错误，不再生成文字。"""
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": METRIC_PROMPT},
+        {"role": "user", "content": content},
+    ]
+    first = _model_client().chat.completions.create(
+        model=_model_setting("OPENAI_MODEL"),
+        messages=messages,
+        tools=[METRIC_TOOL],
+        tool_choice={"type": "function", "function": {"name": "summarize_measurements"}},
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    tool_calls = first.choices[0].message.tool_calls
+    if not tool_calls:
+        raise HTTPException(status_code=502, detail="模型没有调用计算工具")
+    call = tool_calls[0]
+    if call.type != "function" or call.function.name != "summarize_measurements":
+        raise HTTPException(status_code=502, detail="模型没有调用计算工具")
+    stats = _summarize_measurements(values, threshold)
+    assistant: ChatCompletionAssistantMessageParam = {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
+            }
+        ],
+    }
+    messages.append(assistant)
+    messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": json.dumps(stats.model_dump(), ensure_ascii=False),
+        }
+    )
+    second = _model_client().chat.completions.create(
+        model=_model_setting("OPENAI_MODEL"),
+        messages=messages,
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    answer = second.choices[0].message.content
+    if not answer:
+        raise HTTPException(status_code=502, detail="模型没有返回文字")
+    return answer, stats
+
+
+@app.post("/metrics")
+def ask_metrics(body: MetricCreate, user: UserOut = Depends(get_current_user)) -> MetricOut:
+    """根据 pandas 的计算结果回答。计算失败时不会让模型编造数字。"""
+    answer, stats = _ask_about_metrics(body.content, body.values, body.threshold)
+    return MetricOut(answer=answer, mean=stats.mean, anomaly_count=stats.anomaly_count)

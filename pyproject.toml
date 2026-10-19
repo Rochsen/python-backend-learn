@@ -8,6 +8,7 @@ dependencies = [
     "fastapi==0.115.6",
     "notebook>=7.6.3",
     "openai>=3.35.1",
+    "pandas>=3.0.6",
     "pyjwt>=2.15.1",
     "python-dotenv>=1.2.4",
     "python-multipart==0.0.20",
