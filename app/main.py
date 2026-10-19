@@ -10,6 +10,7 @@
 第 8 课：批次接口必须登录。用户只能看到自己的记录。
 第 10 课：对话发给模型后写入数据库，重启服务后仍然在。
 第 11 课：/chat 用 SSE 逐段返回文字，结束后仍写入数据库。
+第 12 课：质控描述解析成固定 JSON，并记下 token 用量。
 """
 
 import csv
@@ -18,6 +19,7 @@ import json
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 from io import StringIO
 
 import jwt
@@ -28,7 +30,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, inspect, select
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, inspect, select
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
@@ -99,6 +101,23 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime)
 
 
+class QcReport(Base):
+    """数据库表 qc_reports。保存质控 JSON 和这次调用的 token 用量。"""
+
+    __tablename__ = "qc_reports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    sample_id: Mapped[str] = mapped_column(String(50))
+    conclusion: Mapped[str] = mapped_column(String(20))
+    issues: Mapped[str] = mapped_column(Text)
+    summary: Mapped[str] = mapped_column(Text)
+    prompt_tokens: Mapped[int] = mapped_column(Integer)
+    completion_tokens: Mapped[int] = mapped_column(Integer)
+    total_tokens: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
 class UserCreate(BaseModel):
     """Schema：注册请求体。"""
 
@@ -141,10 +160,43 @@ class MessageOut(BaseModel):
     content: str
 
 
+class QcCreate(BaseModel):
+    """Schema：一段质控描述。"""
+
+    description: str = Field(min_length=1, max_length=2000, description="质控描述")
+
+
+class QcResult(BaseModel):
+    """Schema：模型必须返回的质控 JSON。"""
+
+    sample_id: str = Field(min_length=1, max_length=50)
+    conclusion: Literal["pass", "fail", "review"]
+    issues: list[str]
+    summary: str = Field(min_length=1, max_length=500)
+
+
+class QcOut(QcResult):
+    """Schema：已保存的质控结果，带上 token 用量。"""
+
+    id: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
 # 第 7 课把签名密钥放在代码里，用来签发和校验 JWT。
 JWT_SECRET = "labassist-lesson-7"
 JWT_ALGORITHM = "HS256"
 SYSTEM_PROMPT = "你是实验室文档助手，用简短中文回答。"
+QC_PROMPT = """你是实验室质控助手。请把用户的描述解析成 JSON。
+示例：
+{
+    "sample_id":"S001",
+    "conclusion":"fail",
+    "issues":["内参 Ct 值高于阈值"],
+    "summary":"本次质控不合格"
+}
+conclusion 只能是 pass、fail、review。没有问题时 issues 用空数组。"""
 
 load_dotenv()
 
@@ -410,3 +462,84 @@ def list_messages(user: UserOut = Depends(get_current_user)) -> list[MessageOut]
             select(Message).where(Message.user_id == user.id).order_by(Message.id)
         ).all()
         return [_to_message(record) for record in records]
+
+
+def _to_qc(record: QcReport) -> QcOut:
+    """把数据库行转成接口响应的 schema。"""
+    result = QcResult.model_validate(
+        {
+            "sample_id": record.sample_id,
+            "conclusion": record.conclusion,
+            "issues": json.loads(record.issues),
+            "summary": record.summary,
+        }
+    )
+    return QcOut(
+        id=record.id,
+        sample_id=result.sample_id,
+        conclusion=result.conclusion,
+        issues=result.issues,
+        summary=result.summary,
+        prompt_tokens=record.prompt_tokens,
+        completion_tokens=record.completion_tokens,
+        total_tokens=record.total_tokens,
+    )
+
+
+def _parse_qc(description: str) -> tuple[QcResult, int, int, int]:
+    """让模型输出 JSON，再用 QcResult 检查字段，并取出 token 用量。"""
+    completion = _model_client().chat.completions.create(
+        model=_model_setting("OPENAI_MODEL"),
+        messages=[
+            {"role": "system", "content": QC_PROMPT},
+            {"role": "user", "content": description},
+        ],
+        response_format={"type": "json_object"},
+    )
+    content = completion.choices[0].message.content
+    usage = completion.usage
+    if (
+        not content
+        or usage is None
+        or usage.prompt_tokens is None
+        or usage.completion_tokens is None
+        or usage.total_tokens is None
+    ):
+        raise HTTPException(status_code=502, detail="模型没有返回质控 JSON")
+    try:
+        result = QcResult.model_validate_json(content)
+    except ValidationError as exc:
+        raise HTTPException(status_code=502, detail="模型返回的 JSON 不符合质控结构") from exc
+    return result, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+
+
+@app.post("/qc-reports", status_code=201)
+def create_qc_report(body: QcCreate, user: UserOut = Depends(get_current_user)) -> QcOut:
+    """解析质控描述并保存。token 用量和 JSON 字段一起写入数据库。"""
+    result, prompt_tokens, completion_tokens, total_tokens = _parse_qc(body.description)
+    record = QcReport(
+        user_id=user.id,
+        sample_id=result.sample_id,
+        conclusion=result.conclusion,
+        issues=json.dumps(result.issues, ensure_ascii=False),
+        summary=result.summary,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        created_at=datetime.now(timezone.utc),
+    )
+    with Session(engine) as session:
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return _to_qc(record)
+
+
+@app.get("/qc-reports")
+def list_qc_reports(user: UserOut = Depends(get_current_user)) -> list[QcOut]:
+    """返回当前用户保存的质控结果。"""
+    with Session(engine) as session:
+        records = session.scalars(
+            select(QcReport).where(QcReport.user_id == user.id).order_by(QcReport.id)
+        ).all()
+        return [_to_qc(record) for record in records]
