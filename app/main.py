@@ -14,11 +14,13 @@
 第 13 课：提问时模型调用查询工具，数字来自数据库。
 第 14 课：pandas 计算均值和异常数。计算失败时返回错误，不让模型编造数字。
 第 15 课：文本切块、转成向量，并写入数据库。
+第 16 课：按相似度找出原文。资料里没有依据时直接回答不知道。
 """
 
 import csv
 import hashlib
 import json
+import math
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -283,14 +285,39 @@ class DocumentOut(BaseModel):
     chunks: list[ChunkOut]
 
 
+class AnswerCreate(BaseModel):
+    """Schema：向已入库文档提的问题。"""
+
+    content: str = Field(min_length=1, max_length=2000, description="要问的问题")
+
+
+class CitationOut(BaseModel):
+    """Schema：回答所依据的一段原文。"""
+
+    document_id: int
+    title: str
+    position: int
+    content: str
+
+
+class AnswerOut(BaseModel):
+    """Schema：带原文片段的回答。没有依据时 citations 为空。"""
+
+    answer: str
+    citations: list[CitationOut]
+
+
 # 第 7 课把签名密钥放在代码里，用来签发和校验 JWT。
 JWT_SECRET = "labassist-lesson-7"
 JWT_ALGORITHM = "HS256"
 CHUNK_SIZE = 60
 CHUNK_OVERLAP = 15
 EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+RETRIEVAL_MIN_SCORE = 0.5
+RETRIEVAL_LIMIT = 3
 _embedder: TextEmbedding | None = None
 SYSTEM_PROMPT = "你是实验室文档助手，用简短中文回答。"
+KNOWLEDGE_PROMPT = "你是实验室文档助手。只根据给出的原文用简短中文回答，不要补充原文里没有的内容。"
 QC_PROMPT = """你是实验室质控助手。请把用户的描述解析成 JSON。
 示例：
 {
@@ -917,3 +944,62 @@ def list_documents(user: UserOut = Depends(get_current_user)) -> list[DocumentOu
             _to_document(document, _load_chunks(session, document.id, user.id))
             for document in documents
         ]
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    """计算两条向量的余弦相似度。"""
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def _search_chunks(user_id: int, question: str) -> list[CitationOut]:
+    """在当前用户的文本块里找出足够相似的原文。"""
+    query_vector = _embed_texts([question])[0]
+    with Session(engine) as session:
+        rows = session.execute(
+            select(Chunk, Document)
+            .join(Document, Chunk.document_id == Document.id)
+            .where(Chunk.user_id == user_id)
+        ).all()
+    ranked: list[tuple[float, CitationOut]] = []
+    for chunk, document in rows:
+        vector: list[float] = json.loads(chunk.embedding)
+        score = _cosine_similarity(query_vector, vector)
+        if score < RETRIEVAL_MIN_SCORE:
+            continue
+        ranked.append(
+            (
+                score,
+                CitationOut(
+                    document_id=document.id,
+                    title=document.title,
+                    position=chunk.position,
+                    content=chunk.content,
+                ),
+            )
+        )
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [citation for _, citation in ranked[:RETRIEVAL_LIMIT]]
+
+
+def _ask_with_citations(question: str, citations: list[CitationOut]) -> str:
+    """把检索到的原文交给模型，由模型写成回答。"""
+    excerpts = "\n".join(f"[{index}] {item.content}" for index, item in enumerate(citations, start=1))
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": KNOWLEDGE_PROMPT},
+        {"role": "user", "content": f"原文：\n{excerpts}\n\n问题：{question}"},
+    ]
+    return _ask_model(messages)
+
+
+@app.post("/answers")
+def answer_from_documents(body: AnswerCreate, user: UserOut = Depends(get_current_user)) -> AnswerOut:
+    """用当前用户的文档回答。没有足够相似的原文时，不调用模型，直接回答不知道。"""
+    citations = _search_chunks(user.id, body.content)
+    if not citations:
+        return AnswerOut(answer="不知道", citations=[])
+    return AnswerOut(answer=_ask_with_citations(body.content, citations), citations=citations)
