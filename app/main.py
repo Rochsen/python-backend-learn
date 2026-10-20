@@ -16,6 +16,7 @@
 第 15 课：文本切块、转成向量，并写入数据库。
 第 16 课：按相似度找出原文。资料里没有依据时直接回答不知道。
 第 17 课：用 20 条已标明出处的问题计算检索命中率。
+第 18 课：把切块改短后再测一遍，留下前后两次命中率。
 """
 
 import csv
@@ -163,6 +164,25 @@ class Evaluation(Base):
     total: Mapped[int] = mapped_column(Integer)
     hit_count: Mapped[int] = mapped_column(Integer)
     hit_rate: Mapped[float] = mapped_column(Float)
+    detail: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class EvaluationComparison(Base):
+    """数据库表 evaluation_comparisons。同一次评测里切块调整前后的命中率。"""
+
+    __tablename__ = "evaluation_comparisons"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    before_chunk_size: Mapped[int] = mapped_column(Integer)
+    before_chunk_overlap: Mapped[int] = mapped_column(Integer)
+    before_hit_count: Mapped[int] = mapped_column(Integer)
+    before_hit_rate: Mapped[float] = mapped_column(Float)
+    after_chunk_size: Mapped[int] = mapped_column(Integer)
+    after_chunk_overlap: Mapped[int] = mapped_column(Integer)
+    after_hit_count: Mapped[int] = mapped_column(Integer)
+    after_hit_rate: Mapped[float] = mapped_column(Float)
     detail: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime)
 
@@ -348,11 +368,32 @@ class EvaluationOut(BaseModel):
     items: list[EvaluationItemOut]
 
 
+class ChunkRunOut(BaseModel):
+    """Schema：一种切块设置下的命中率。"""
+
+    chunk_size: int
+    chunk_overlap: int
+    total: int
+    hit_count: int
+    hit_rate: float
+
+
+class EvaluationComparisonOut(BaseModel):
+    """Schema：切块调整前后的两次命中率。"""
+
+    id: int
+    before: ChunkRunOut
+    after: ChunkRunOut
+    misses: list[EvaluationItemOut]
+
+
 # 第 7 课把签名密钥放在代码里，用来签发和校验 JWT。
 JWT_SECRET = "labassist-lesson-7"
 JWT_ALGORITHM = "HS256"
 CHUNK_SIZE = 60
 CHUNK_OVERLAP = 15
+ADJUSTED_CHUNK_SIZE = 8
+ADJUSTED_CHUNK_OVERLAP = 0
 EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 RETRIEVAL_MIN_SCORE = 0.5
 RETRIEVAL_LIMIT = 3
@@ -887,18 +928,18 @@ def ask_metrics(body: MetricCreate, user: UserOut = Depends(get_current_user)) -
     return MetricOut(answer=answer, mean=stats.mean, anomaly_count=stats.anomaly_count)
 
 
-def _split_text(text: str) -> list[str]:
+def _split_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> list[str]:
     """按固定长度切块，相邻块保留一段重叠。"""
     chunks: list[str] = []
     start = 0
     while start < len(text):
-        end = min(start + CHUNK_SIZE, len(text))
+        end = min(start + chunk_size, len(text))
         piece = text[start:end].strip()
         if piece:
             chunks.append(piece)
         if end == len(text):
             break
-        start = end - CHUNK_OVERLAP
+        start = end - chunk_overlap
     return chunks
 
 
@@ -1083,21 +1124,28 @@ GOLD_QUESTIONS: list[tuple[str, str]] = [
 ]
 
 
-def _gold_chunks() -> list[tuple[str, str, list[float]]]:
+def _gold_chunks(
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP,
+) -> list[tuple[str, str, list[float]]]:
     """把金标 SOP 切块并转成向量。切分方式和文档入库相同。"""
     titles: list[str] = []
     pieces: list[str] = []
     for title, content in GOLD_DOCUMENTS:
-        for piece in _split_text(content):
+        for piece in _split_text(content, chunk_size, chunk_overlap):
             titles.append(title)
             pieces.append(piece)
     vectors = _embed_texts(pieces)
     return list(zip(titles, pieces, vectors))
 
 
-def _evaluate_retrieval() -> list[EvaluationItemOut]:
+def _evaluate_retrieval(
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP,
+    require_top: bool = False,
+) -> list[EvaluationItemOut]:
     """用同一套相似度规则检索 20 道题，并对照应引用的段落。"""
-    chunks = _gold_chunks()
+    chunks = _gold_chunks(chunk_size, chunk_overlap)
     questions = [question for question, _ in GOLD_QUESTIONS]
     query_vectors = _embed_texts(questions)
     items: list[EvaluationItemOut] = []
@@ -1110,15 +1158,32 @@ def _evaluate_retrieval() -> list[EvaluationItemOut]:
             ranked.append((score, EvaluationCitation(title=title, content=content)))
         ranked.sort(key=lambda item: item[0], reverse=True)
         citations = [citation for _, citation in ranked[:RETRIEVAL_LIMIT]]
+        if require_top:
+            hit = bool(citations) and citations[0].title == expected_title
+        else:
+            hit = any(citation.title == expected_title for citation in citations)
         items.append(
             EvaluationItemOut(
                 question=question,
                 expected_title=expected_title,
-                hit=any(citation.title == expected_title for citation in citations),
+                hit=hit,
                 citations=citations,
             )
         )
     return items
+
+
+def _chunk_run(chunk_size: int, chunk_overlap: int, items: list[EvaluationItemOut]) -> ChunkRunOut:
+    """把一种切块设置的结果收成命中率。"""
+    hit_count = sum(1 for item in items if item.hit)
+    total = len(items)
+    return ChunkRunOut(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        total=total,
+        hit_count=hit_count,
+        hit_rate=round(hit_count / total, 2),
+    )
 
 
 def _to_evaluation(record: Evaluation) -> EvaluationOut:
@@ -1163,3 +1228,67 @@ def list_evaluations(user: UserOut = Depends(get_current_user)) -> list[Evaluati
             select(Evaluation).where(Evaluation.user_id == user.id).order_by(Evaluation.id)
         ).all()
         return [_to_evaluation(record) for record in records]
+
+
+def _to_comparison(record: EvaluationComparison) -> EvaluationComparisonOut:
+    """把一次切块对比转成接口响应。"""
+    misses = [EvaluationItemOut.model_validate(item) for item in json.loads(record.detail)]
+    return EvaluationComparisonOut(
+        id=record.id,
+        before=ChunkRunOut(
+            chunk_size=record.before_chunk_size,
+            chunk_overlap=record.before_chunk_overlap,
+            total=len(GOLD_QUESTIONS),
+            hit_count=record.before_hit_count,
+            hit_rate=record.before_hit_rate,
+        ),
+        after=ChunkRunOut(
+            chunk_size=record.after_chunk_size,
+            chunk_overlap=record.after_chunk_overlap,
+            total=len(GOLD_QUESTIONS),
+            hit_count=record.after_hit_count,
+            hit_rate=record.after_hit_rate,
+        ),
+        misses=misses,
+    )
+
+
+@app.post("/evaluation-comparisons", status_code=201)
+def create_evaluation_comparison(user: UserOut = Depends(get_current_user)) -> EvaluationComparisonOut:
+    """用原来的切块和改短后的切块各测一遍，两次命中率一起保存。"""
+    before_items = _evaluate_retrieval(require_top=True)
+    after_items = _evaluate_retrieval(ADJUSTED_CHUNK_SIZE, ADJUSTED_CHUNK_OVERLAP, require_top=True)
+    before = _chunk_run(CHUNK_SIZE, CHUNK_OVERLAP, before_items)
+    after = _chunk_run(ADJUSTED_CHUNK_SIZE, ADJUSTED_CHUNK_OVERLAP, after_items)
+    misses = [item for item in after_items if not item.hit]
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        record = EvaluationComparison(
+            user_id=user.id,
+            before_chunk_size=before.chunk_size,
+            before_chunk_overlap=before.chunk_overlap,
+            before_hit_count=before.hit_count,
+            before_hit_rate=before.hit_rate,
+            after_chunk_size=after.chunk_size,
+            after_chunk_overlap=after.chunk_overlap,
+            after_hit_count=after.hit_count,
+            after_hit_rate=after.hit_rate,
+            detail=json.dumps([item.model_dump() for item in misses], ensure_ascii=False),
+            created_at=now,
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return _to_comparison(record)
+
+
+@app.get("/evaluation-comparisons")
+def list_evaluation_comparisons(user: UserOut = Depends(get_current_user)) -> list[EvaluationComparisonOut]:
+    """返回当前用户的切块对比。重启服务后仍然在。"""
+    with Session(engine) as session:
+        records = session.scalars(
+            select(EvaluationComparison)
+            .where(EvaluationComparison.user_id == user.id)
+            .order_by(EvaluationComparison.id)
+        ).all()
+        return [_to_comparison(record) for record in records]
