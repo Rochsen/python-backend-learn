@@ -13,6 +13,7 @@
 第 12 课：质控描述解析成固定 JSON，并记下 token 用量。
 第 13 课：提问时模型调用查询工具，数字来自数据库。
 第 14 课：pandas 计算均值和异常数。计算失败时返回错误，不让模型编造数字。
+第 15 课：文本切块、转成向量，并写入数据库。
 """
 
 import csv
@@ -26,6 +27,10 @@ from io import StringIO
 
 import jwt
 import pandas as pd
+
+# 本机访问 huggingface.co 会超时，向量模型改从国内镜像下载。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+from fastembed import TextEmbedding
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -119,6 +124,30 @@ class QcReport(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer)
     total_tokens: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class Document(Base):
+    """数据库表 documents。一篇自己编写的 SOP 样例。"""
+
+    __tablename__ = "documents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    title: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class Chunk(Base):
+    """数据库表 chunks。一篇文档切出的文本块及其向量。"""
+
+    __tablename__ = "chunks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    position: Mapped[int] = mapped_column(Integer)
+    content: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[str] = mapped_column(Text)
 
 
 class UserCreate(BaseModel):
@@ -229,9 +258,38 @@ class MetricOut(MetricStats):
     answer: str
 
 
+class DocumentCreate(BaseModel):
+    """Schema：要入库的 SOP 样例。"""
+
+    title: str = Field(min_length=1, max_length=100, description="文档标题")
+    content: str = Field(min_length=1, max_length=8000, description="文档正文")
+
+
+class ChunkOut(BaseModel):
+    """Schema：一个文本块。向量本身存在数据库里，这里只返回维度。"""
+
+    position: int
+    content: str
+    embedding_dim: int
+
+
+class DocumentOut(BaseModel):
+    """Schema：已保存的文档和它的文本块。"""
+
+    id: int
+    title: str
+    chunk_count: int
+    embedding_dim: int
+    chunks: list[ChunkOut]
+
+
 # 第 7 课把签名密钥放在代码里，用来签发和校验 JWT。
 JWT_SECRET = "labassist-lesson-7"
 JWT_ALGORITHM = "HS256"
+CHUNK_SIZE = 60
+CHUNK_OVERLAP = 15
+EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+_embedder: TextEmbedding | None = None
 SYSTEM_PROMPT = "你是实验室文档助手，用简短中文回答。"
 QC_PROMPT = """你是实验室质控助手。请把用户的描述解析成 JSON。
 示例：
@@ -759,3 +817,103 @@ def ask_metrics(body: MetricCreate, user: UserOut = Depends(get_current_user)) -
     """根据 pandas 的计算结果回答。计算失败时不会让模型编造数字。"""
     answer, stats = _ask_about_metrics(body.content, body.values, body.threshold)
     return MetricOut(answer=answer, mean=stats.mean, anomaly_count=stats.anomaly_count)
+
+
+def _split_text(text: str) -> list[str]:
+    """按固定长度切块，相邻块保留一段重叠。"""
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + CHUNK_SIZE, len(text))
+        piece = text[start:end].strip()
+        if piece:
+            chunks.append(piece)
+        if end == len(text):
+            break
+        start = end - CHUNK_OVERLAP
+    return chunks
+
+
+def _get_embedder() -> TextEmbedding:
+    """加载本机中文向量模型。DeepSeek 的对话接口不提供向量。"""
+    global _embedder
+    if _embedder is None:
+        _embedder = TextEmbedding(model_name=EMBEDDING_MODEL)
+    return _embedder
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    """把每个文本块转成一条向量。"""
+    vectors = [vector.tolist() for vector in _get_embedder().embed(texts)]
+    if len(vectors) != len(texts):
+        raise HTTPException(status_code=500, detail="向量数量和文本块不一致")
+    return vectors
+
+
+def _to_document(record: Document, chunks: list[Chunk]) -> DocumentOut:
+    """把文档和文本块转成接口响应。"""
+    dims = [len(json.loads(chunk.embedding)) for chunk in chunks]
+    return DocumentOut(
+        id=record.id,
+        title=record.title,
+        chunk_count=len(chunks),
+        embedding_dim=dims[0] if dims else 0,
+        chunks=[
+            ChunkOut(position=chunk.position, content=chunk.content, embedding_dim=dim)
+            for chunk, dim in zip(chunks, dims)
+        ],
+    )
+
+
+def _load_chunks(session: Session, document_id: int, user_id: int) -> list[Chunk]:
+    """读取某篇文档下、属于当前用户的文本块。"""
+    return list(
+        session.scalars(
+            select(Chunk)
+            .where(Chunk.document_id == document_id, Chunk.user_id == user_id)
+            .order_by(Chunk.position)
+        ).all()
+    )
+
+
+@app.post("/documents", status_code=201)
+def create_document(body: DocumentCreate, user: UserOut = Depends(get_current_user)) -> DocumentOut:
+    """切分正文，生成向量，并和文本块一起写入数据库。"""
+    pieces = _split_text(body.content)
+    if not pieces:
+        raise HTTPException(status_code=400, detail="没有可入库的文本")
+    vectors = _embed_texts(pieces)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        document = Document(user_id=user.id, title=body.title, created_at=now)
+        session.add(document)
+        session.commit()
+        session.refresh(document)
+        stored = [
+            Chunk(
+                document_id=document.id,
+                user_id=user.id,
+                position=position,
+                content=piece,
+                embedding=json.dumps(vector),
+            )
+            for position, (piece, vector) in enumerate(zip(pieces, vectors))
+        ]
+        session.add_all(stored)
+        session.commit()
+        for chunk in stored:
+            session.refresh(chunk)
+        return _to_document(document, stored)
+
+
+@app.get("/documents")
+def list_documents(user: UserOut = Depends(get_current_user)) -> list[DocumentOut]:
+    """返回当前用户已入库的文档。重启服务后仍然在。"""
+    with Session(engine) as session:
+        documents = session.scalars(
+            select(Document).where(Document.user_id == user.id).order_by(Document.id)
+        ).all()
+        return [
+            _to_document(document, _load_chunks(session, document.id, user.id))
+            for document in documents
+        ]
