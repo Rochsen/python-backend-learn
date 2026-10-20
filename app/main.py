@@ -15,6 +15,7 @@
 第 14 课：pandas 计算均值和异常数。计算失败时返回错误，不让模型编造数字。
 第 15 课：文本切块、转成向量，并写入数据库。
 第 16 课：按相似度找出原文。资料里没有依据时直接回答不知道。
+第 17 课：用 20 条已标明出处的问题计算检索命中率。
 """
 
 import csv
@@ -40,7 +41,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import OpenAI
 from openai.types.chat import ChatCompletionAssistantMessageParam, ChatCompletionFunctionToolParam, ChatCompletionMessageParam
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, inspect, select
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, inspect, select
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
@@ -150,6 +151,20 @@ class Chunk(Base):
     position: Mapped[int] = mapped_column(Integer)
     content: Mapped[str] = mapped_column(Text)
     embedding: Mapped[str] = mapped_column(Text)
+
+
+class Evaluation(Base):
+    """数据库表 evaluations。一次金标评测的命中结果。"""
+
+    __tablename__ = "evaluations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    total: Mapped[int] = mapped_column(Integer)
+    hit_count: Mapped[int] = mapped_column(Integer)
+    hit_rate: Mapped[float] = mapped_column(Float)
+    detail: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
 
 
 class UserCreate(BaseModel):
@@ -305,6 +320,32 @@ class AnswerOut(BaseModel):
 
     answer: str
     citations: list[CitationOut]
+
+
+class EvaluationCitation(BaseModel):
+    """Schema：评测时检索到的一段原文。"""
+
+    title: str
+    content: str
+
+
+class EvaluationItemOut(BaseModel):
+    """Schema：一道金标题的检索结果。"""
+
+    question: str
+    expected_title: str
+    hit: bool
+    citations: list[EvaluationCitation]
+
+
+class EvaluationOut(BaseModel):
+    """Schema：一次评测的命中率，以及每道题的对照。"""
+
+    id: int
+    total: int
+    hit_count: int
+    hit_rate: float
+    items: list[EvaluationItemOut]
 
 
 # 第 7 课把签名密钥放在代码里，用来签发和校验 JWT。
@@ -1003,3 +1044,122 @@ def answer_from_documents(body: AnswerCreate, user: UserOut = Depends(get_curren
     if not citations:
         return AnswerOut(answer="不知道", citations=[])
     return AnswerOut(answer=_ask_with_citations(body.content, citations), citations=citations)
+
+
+GOLD_DOCUMENTS: list[tuple[str, str]] = [
+    ("样本接收", "收到样本后先核对编号和送检单是否一致。编号不一致时停止检测，并记录异常原因。核对完成后把样本交给检测岗位。交接时双方在接收记录上签名，并注明接收时间。"),
+    ("样本保存", "全血样本放在 2 到 8 摄氏度冷藏，不要冷冻。保存时间不超过 24 小时。超时样本需要重新采集。冷藏箱温度每天记录两次，超出范围时转移样本并上报。"),
+    ("试剂准备", "试剂使用前从冷藏取出，恢复到室温后再打开。不同批号的试剂不要混用。开瓶时间写在瓶身标签上。开瓶后的试剂按说明书期限使用，过期试剂不得继续检测。"),
+    ("仪器校准", "每天开机后先做空白校准，空白通过后才能检测样本。校准失败时停止上机，并通知设备管理员。管理员排除故障前，不得改用备用参数继续检测。"),
+    ("室内质控", "每批检测都要加入阴性质控和阳性质控。质控未通过时，该批样本结果不得发出。质控图上的点超出规则时，先查找原因，再决定是否复测。"),
+    ("结果复核", "超出参考范围的结果由另一名人员复核。复核人与检测人不能是同一人。复核意见写入原始记录。复核不同意时，结果保持未发布，直到重新检测完成。"),
+    ("废弃处理", "使用过的针头放入利器盒，不得丢进生活垃圾桶。利器盒装到三分之二时封口，按医疗废物交接。交接单上写明数量和日期，生活垃圾通道不能接收利器盒。"),
+    ("报告发放", "报告经审核人签字后才能发放。未签字的报告不得告诉受检者结果。发放时核对受检者姓名和样本编号。电话告知结果同样要先完成审核，并留下告知记录。"),
+    ("生物安全", "实验操作戴手套和口罩。发生样本溅出时，先覆盖消毒，再清理台面，并记录事件。消毒接触时间按消毒液说明书执行，未处理完不得继续检测下一批。"),
+    ("记录归档", "原始记录当天归档，保存期限按实验室规定执行。记录不得涂改，写错时划改并签名。归档后借出记录要登记归还日期，缺页记录不能入库。"),
+]
+
+GOLD_QUESTIONS: list[tuple[str, str]] = [
+    ("编号和送检单对不上怎么办", "样本接收"),
+    ("样本核对之后交给谁", "样本接收"),
+    ("全血应该放在多少度", "样本保存"),
+    ("冷藏超过一天的样本还能用吗", "样本保存"),
+    ("试剂拿出冷藏后要怎么处理", "试剂准备"),
+    ("两个批号的试剂能倒在一起吗", "试剂准备"),
+    ("每天开机第一件事是什么", "仪器校准"),
+    ("空白校准失败了还能测样本吗", "仪器校准"),
+    ("每一批检测要加什么质控", "室内质控"),
+    ("质控没过的这批结果能发吗", "室内质控"),
+    ("结果高出参考范围谁来看", "结果复核"),
+    ("检测人可以自己复核自己的结果吗", "结果复核"),
+    ("用过的针头扔哪里", "废弃处理"),
+    ("利器盒什么时候封口", "废弃处理"),
+    ("报告没有签字能告诉受检者吗", "报告发放"),
+    ("发放报告时要核对哪些信息", "报告发放"),
+    ("样本溅到台面上怎么处理", "生物安全"),
+    ("做实验要戴什么防护", "生物安全"),
+    ("原始记录当天要做什么", "记录归档"),
+    ("记录写错了能不能涂掉", "记录归档"),
+]
+
+
+def _gold_chunks() -> list[tuple[str, str, list[float]]]:
+    """把金标 SOP 切块并转成向量。切分方式和文档入库相同。"""
+    titles: list[str] = []
+    pieces: list[str] = []
+    for title, content in GOLD_DOCUMENTS:
+        for piece in _split_text(content):
+            titles.append(title)
+            pieces.append(piece)
+    vectors = _embed_texts(pieces)
+    return list(zip(titles, pieces, vectors))
+
+
+def _evaluate_retrieval() -> list[EvaluationItemOut]:
+    """用同一套相似度规则检索 20 道题，并对照应引用的段落。"""
+    chunks = _gold_chunks()
+    questions = [question for question, _ in GOLD_QUESTIONS]
+    query_vectors = _embed_texts(questions)
+    items: list[EvaluationItemOut] = []
+    for (question, expected_title), query_vector in zip(GOLD_QUESTIONS, query_vectors):
+        ranked: list[tuple[float, EvaluationCitation]] = []
+        for title, content, vector in chunks:
+            score = _cosine_similarity(query_vector, vector)
+            if score < RETRIEVAL_MIN_SCORE:
+                continue
+            ranked.append((score, EvaluationCitation(title=title, content=content)))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        citations = [citation for _, citation in ranked[:RETRIEVAL_LIMIT]]
+        items.append(
+            EvaluationItemOut(
+                question=question,
+                expected_title=expected_title,
+                hit=any(citation.title == expected_title for citation in citations),
+                citations=citations,
+            )
+        )
+    return items
+
+
+def _to_evaluation(record: Evaluation) -> EvaluationOut:
+    """把一次评测记录转成接口响应。"""
+    items = [EvaluationItemOut.model_validate(item) for item in json.loads(record.detail)]
+    return EvaluationOut(
+        id=record.id,
+        total=record.total,
+        hit_count=record.hit_count,
+        hit_rate=record.hit_rate,
+        items=items,
+    )
+
+
+@app.post("/evaluations", status_code=201)
+def create_evaluation(user: UserOut = Depends(get_current_user)) -> EvaluationOut:
+    """对 20 条金标问题做检索，保存命中率。数字来自向量比较，不由模型生成。"""
+    items = _evaluate_retrieval()
+    hit_count = sum(1 for item in items if item.hit)
+    total = len(items)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        record = Evaluation(
+            user_id=user.id,
+            total=total,
+            hit_count=hit_count,
+            hit_rate=round(hit_count / total, 2),
+            detail=json.dumps([item.model_dump() for item in items], ensure_ascii=False),
+            created_at=now,
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return _to_evaluation(record)
+
+
+@app.get("/evaluations")
+def list_evaluations(user: UserOut = Depends(get_current_user)) -> list[EvaluationOut]:
+    """返回当前用户做过的评测。重启服务后仍然在。"""
+    with Session(engine) as session:
+        records = session.scalars(
+            select(Evaluation).where(Evaluation.user_id == user.id).order_by(Evaluation.id)
+        ).all()
+        return [_to_evaluation(record) for record in records]
