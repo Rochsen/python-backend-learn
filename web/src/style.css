@@ -65,6 +65,19 @@ textarea:focus-visible {
   font-size: 0.85rem;
 }
 
+.nav-button {
+  border: 0;
+  background: transparent;
+  color: #b7c9d2;
+  text-align: left;
+  padding: 0.15rem 0;
+  cursor: pointer;
+}
+
+.nav-button.current {
+  color: #f0c48a;
+}
+
 .text-button {
   margin-top: auto;
   align-self: flex-start;
@@ -244,6 +257,17 @@ button[type="submit"]:disabled {
   .sheet {
     min-height: calc(100vh - 3.2rem);
   }
+}
+
+.chart-result {
+  width: min(40rem, 100%);
+  margin: 1.5rem auto 0;
+}
+
+.chart-image {
+  width: 100%;
+  background: var(--paper);
+  border: 1px solid var(--line);
 }
 
 @media (prefers-reduced-motion: reduce) {

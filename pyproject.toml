@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi==0.115.6",
     "fastembed>=0.9.0",
+    "matplotlib>=3.11.2",
     "notebook>=7.6.3",
     "openai>=3.35.1",
     "pandas>=3.0.6",

@@ -11,6 +11,12 @@ const sending = ref(false)
 const errorText = ref("")
 const turns = ref([])
 const threadEnd = ref(null)
+const panel = ref("chat")
+const chartFile = ref(null)
+const chartThreshold = ref("4")
+const chartBusy = ref(false)
+const chartError = ref("")
+const chartResult = ref(null)
 
 const signedIn = computed(() => token.value !== "")
 
@@ -22,6 +28,10 @@ function logout() {
   turns.value = []
   question.value = ""
   errorText.value = ""
+  panel.value = "chat"
+  chartFile.value = null
+  chartError.value = ""
+  chartResult.value = null
 }
 
 async function login() {
@@ -96,6 +106,43 @@ async function stickToBottom() {
   threadEnd.value?.scrollIntoView({ block: "end" })
 }
 
+function onChartFile(event) {
+  chartFile.value = event.target.files[0] || null
+}
+
+async function submitChart() {
+  if (!chartFile.value || chartBusy.value) {
+    return
+  }
+  chartBusy.value = true
+  chartError.value = ""
+  const form = new FormData()
+  form.append("file", chartFile.value)
+  form.append("threshold", chartThreshold.value)
+  try {
+    const response = await fetch("/qc-charts", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token.value}` },
+      body: form,
+    })
+    const body = await response.json()
+    if (response.status === 401) {
+      logout()
+      loginError.value = "登录已失效"
+      return
+    }
+    if (!response.ok) {
+      chartError.value = typeof body.detail === "string" ? body.detail : "上传失败"
+      return
+    }
+    chartResult.value = body
+  } catch {
+    chartError.value = "连接中断"
+  } finally {
+    chartBusy.value = false
+  }
+}
+
 async function ask() {
   const content = question.value.trim()
   if (!content || sending.value) {
@@ -143,6 +190,24 @@ async function ask() {
       <p class="mark">LabAssist</p>
       <p class="role">实验室文档</p>
       <p v-if="signedIn" class="who">{{ username }}</p>
+      <button
+        v-if="signedIn"
+        class="nav-button"
+        :class="{ current: panel === 'chat' }"
+        type="button"
+        @click="panel = 'chat'"
+      >
+        提问
+      </button>
+      <button
+        v-if="signedIn"
+        class="nav-button"
+        :class="{ current: panel === 'chart' }"
+        type="button"
+        @click="panel = 'chart'"
+      >
+        质控图
+      </button>
       <button v-if="signedIn" class="text-button" type="button" @click="logout">退出</button>
     </header>
 
@@ -160,6 +225,34 @@ async function ask() {
         <p v-if="loginError" class="error">{{ loginError }}</p>
         <button type="submit">登录</button>
       </form>
+
+      <template v-else-if="panel === 'chart'">
+        <form class="gate" @submit.prevent="submitChart">
+          <h1>上传质控数据</h1>
+          <label>
+            CSV 文件
+            <input type="file" accept=".csv,text/csv" @change="onChartFile" />
+          </label>
+          <label>
+            阈值
+            <input v-model="chartThreshold" type="number" step="any" required />
+          </label>
+          <p v-if="chartError" class="error">{{ chartError }}</p>
+          <button type="submit" :disabled="chartBusy || !chartFile">生成结论</button>
+        </form>
+        <article v-if="chartResult" class="turn chart-result">
+          <img
+            class="chart-image"
+            :src="'data:image/png;base64,' + chartResult.image_base64"
+            alt="质控图"
+          />
+          <p class="answer">{{ chartResult.conclusion }}</p>
+          <p class="label-body">
+            均值 {{ chartResult.mean }}，异常 {{ chartResult.anomaly_count }} 个，阈值
+            {{ chartResult.threshold }}
+          </p>
+        </article>
+      </template>
 
       <template v-else>
         <section class="thread" aria-live="polite">

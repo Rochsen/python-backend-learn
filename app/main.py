@@ -18,8 +18,10 @@
 第 17 课：用 20 条已标明出处的问题计算检索命中率。
 第 18 课：把切块改短后再测一遍，留下前后两次命中率。
 第 19 课：Vue 页面逐段显示回答，并列出引用的原文。
+第 20 课：上传质控 CSV，用 pandas 画图并写出结论。
 """
 
+import base64
 import csv
 import hashlib
 import json
@@ -29,7 +31,7 @@ import secrets
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Literal
-from io import StringIO
+from io import BytesIO, StringIO
 
 import jwt
 import pandas as pd
@@ -38,7 +40,7 @@ import pandas as pd
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 from fastembed import TextEmbedding
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -54,6 +56,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     create_engine,
@@ -144,6 +147,21 @@ class QcReport(Base):
     prompt_tokens: Mapped[int] = mapped_column(Integer)
     completion_tokens: Mapped[int] = mapped_column(Integer)
     total_tokens: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class QcChart(Base):
+    """数据库表 qc_charts。保存 pandas 画出的质控图和据此写成的结论。"""
+
+    __tablename__ = "qc_charts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    threshold: Mapped[float] = mapped_column(Float)
+    mean: Mapped[float] = mapped_column(Float)
+    anomaly_count: Mapped[int] = mapped_column(Integer)
+    conclusion: Mapped[str] = mapped_column(Text)
+    image: Mapped[bytes] = mapped_column(LargeBinary)
     created_at: Mapped[datetime] = mapped_column(DateTime)
 
 
@@ -312,6 +330,17 @@ class MetricOut(MetricStats):
     answer: str
 
 
+class QcChartOut(BaseModel):
+    """Schema：质控图、pandas 算出的数字，以及据此写成的结论。"""
+
+    id: int
+    threshold: float
+    mean: float
+    anomaly_count: int
+    conclusion: str
+    image_base64: str
+
+
 class DocumentCreate(BaseModel):
     """Schema：要入库的 SOP 样例。"""
 
@@ -450,6 +479,10 @@ METRIC_TOOL: ChatCompletionFunctionToolParam = {
         "description": "用 pandas 计算测量值的均值，以及大于阈值的异常个数。",
     },
 }
+CHART_PROMPT = (
+    "你是实验室质控助手。只用给出的均值、异常个数和阈值写一句简短中文结论。"
+    "不要改动这些数字，也不要补充未给出的测量值。"
+)
 
 load_dotenv()
 
@@ -1427,6 +1460,101 @@ def list_evaluation_comparisons(
             .order_by(EvaluationComparison.id)
         ).all()
         return [_to_comparison(record) for record in records]
+
+
+def _read_qc_csv(raw: bytes) -> tuple[list[str], list[float]]:
+    """读取合成质控 CSV。测量值在 value 列，样本编号在 sample_id 列。"""
+    try:
+        text = raw.decode("utf-8-sig")
+        frame = pd.read_csv(StringIO(text))
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="质控 CSV 需要 UTF-8 编码") from exc
+    except pd.errors.ParserError as exc:
+        raise HTTPException(status_code=400, detail="质控 CSV 无法读取") from exc
+    except pd.errors.EmptyDataError as exc:
+        raise HTTPException(status_code=400, detail="没有可计算的数值") from exc
+    if "value" not in frame.columns:
+        raise HTTPException(status_code=400, detail="质控 CSV 需要 value 列")
+    if "sample_id" in frame.columns:
+        labels = [str(item) for item in frame["sample_id"].tolist()]
+    else:
+        labels = [str(index) for index in range(1, len(frame) + 1)]
+    numeric = pd.Series(pd.to_numeric(frame["value"], errors="coerce"), dtype="float64")
+    values = [float(item) for item in numeric.tolist()]
+    return labels, values
+
+
+def _render_qc_chart(labels: list[str], values: list[float], threshold: float) -> bytes:
+    """用测量值和阈值画一张质控图。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
+    plt.rcParams["axes.unicode_minus"] = False
+    fig, ax = plt.subplots(figsize=(6.4, 3.4))
+    ax.plot(labels, values, marker="o", color="#2f6f8f")
+    ax.axhline(threshold, color="#8a5a2a", linestyle="--")
+    ax.set_xlabel("样本")
+    ax.set_ylabel("测量值")
+    fig.tight_layout()
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png")
+    plt.close(fig)
+    return buffer.getvalue()
+
+
+def _conclude_chart(stats: MetricStats, threshold: float) -> str:
+    """让模型根据 pandas 的数字写一句结论。"""
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": CHART_PROMPT},
+        {
+            "role": "user",
+            "content": f"阈值 {threshold}，均值 {stats.mean}，异常个数 {stats.anomaly_count}。",
+        },
+    ]
+    return _ask_model(messages)
+
+
+def _to_qc_chart(record: QcChart) -> QcChartOut:
+    """把质控图记录转成接口响应。"""
+    return QcChartOut(
+        id=record.id,
+        threshold=record.threshold,
+        mean=record.mean,
+        anomaly_count=record.anomaly_count,
+        conclusion=record.conclusion,
+        image_base64=base64.b64encode(record.image).decode("ascii"),
+    )
+
+
+@app.post("/qc-charts", status_code=201)
+async def create_qc_chart(
+    file: UploadFile = File(description="UTF-8 CSV，表头至少包含 value，可选 sample_id"),
+    threshold: float = Form(description="大于该值的测量值计为异常"),
+    user: UserOut = Depends(get_current_user),
+) -> QcChartOut:
+    """先用 pandas 计算并画图。计算失败时不调用模型。"""
+    labels, values = _read_qc_csv(await file.read())
+    stats = _summarize_measurements(values, threshold)
+    image = _render_qc_chart(labels, values, threshold)
+    conclusion = _conclude_chart(stats, threshold)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        record = QcChart(
+            user_id=user.id,
+            threshold=threshold,
+            mean=stats.mean,
+            anomaly_count=stats.anomaly_count,
+            conclusion=conclusion,
+            image=image,
+            created_at=now,
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return _to_qc_chart(record)
 
 
 app.mount(
