@@ -17,6 +17,7 @@
 第 16 课：按相似度找出原文。资料里没有依据时直接回答不知道。
 第 17 课：用 20 条已标明出处的问题计算检索命中率。
 第 18 课：把切块改短后再测一遍，留下前后两次命中率。
+第 19 课：Vue 页面逐段显示回答，并列出引用的原文。
 """
 
 import csv
@@ -25,6 +26,7 @@ import json
 import math
 import os
 import secrets
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from io import StringIO
@@ -38,11 +40,26 @@ from fastembed import TextEmbedding
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import OpenAI
-from openai.types.chat import ChatCompletionAssistantMessageParam, ChatCompletionFunctionToolParam, ChatCompletionMessageParam
+from openai.types.chat import (
+    ChatCompletionAssistantMessageParam,
+    ChatCompletionFunctionToolParam,
+    ChatCompletionMessageParam,
+)
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, inspect, select
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    inspect,
+    select,
+)
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
@@ -399,7 +416,9 @@ RETRIEVAL_MIN_SCORE = 0.5
 RETRIEVAL_LIMIT = 3
 _embedder: TextEmbedding | None = None
 SYSTEM_PROMPT = "你是实验室文档助手，用简短中文回答。"
-KNOWLEDGE_PROMPT = "你是实验室文档助手。只根据给出的原文用简短中文回答，不要补充原文里没有的内容。"
+KNOWLEDGE_PROMPT = (
+    "你是实验室文档助手。只根据给出的原文用简短中文回答，不要补充原文里没有的内容。"
+)
 QC_PROMPT = """你是实验室质控助手。请把用户的描述解析成 JSON。
 示例：
 {
@@ -444,7 +463,9 @@ def _ensure_batch_user_id() -> None:
     columns = {column["name"] for column in inspect(engine).get_columns("batches")}
     if "user_id" not in columns:
         with engine.begin() as connection:
-            connection.execute(sql_text("ALTER TABLE batches ADD COLUMN user_id INTEGER"))
+            connection.execute(
+                sql_text("ALTER TABLE batches ADD COLUMN user_id INTEGER")
+            )
 
 
 _ensure_batch_user_id()
@@ -460,7 +481,9 @@ def get_current_user(
     if credentials is None:
         raise HTTPException(status_code=401, detail="未登录")
     try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM]
+        )
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="登录已失效") from None
     username = payload.get("sub")
@@ -494,7 +517,9 @@ def health() -> dict[str, str]:
 
 
 @app.post("/batches", status_code=201)
-def create_batch(body: BatchCreate, user: UserOut = Depends(get_current_user)) -> BatchOut:
+def create_batch(
+    body: BatchCreate, user: UserOut = Depends(get_current_user)
+) -> BatchOut:
     """创建一条送检批次，并分配自增编号。记录归当前登录用户所有。"""
     record = Batch(
         status="pending",
@@ -534,7 +559,9 @@ def get_batch(batch_id: int, user: UserOut = Depends(get_current_user)) -> Batch
 
 @app.post("/batches/import", status_code=201)
 async def import_batches(
-    file: UploadFile = File(description="UTF-8 CSV，表头：sample_id,sample_name,sample_type,org_name,accept_time"),
+    file: UploadFile = File(
+        description="UTF-8 CSV，表头：sample_id,sample_name,sample_type,org_name,accept_time"
+    ),
     user: UserOut = Depends(get_current_user),
 ) -> list[BatchOut]:
     """按行创建记录。每一行使用和 POST /batches 相同的字段校验。"""
@@ -598,7 +625,9 @@ def login(body: Login) -> TokenOut:
         record = session.scalar(select(User).where(User.username == body.username))
         if record is None or not _verify_password(body.password, record.password_hash):
             raise HTTPException(status_code=401, detail="用户名或密码错误")
-        return TokenOut(access_token=_create_access_token(record.username), token_type="bearer")
+        return TokenOut(
+            access_token=_create_access_token(record.username), token_type="bearer"
+        )
 
 
 def _model_setting(name: str) -> str:
@@ -658,7 +687,9 @@ def _to_message(record: Message) -> MessageOut:
 
 
 @app.post("/chat")
-def chat(body: ChatCreate, user: UserOut = Depends(get_current_user)) -> StreamingResponse:
+def chat(
+    body: ChatCreate, user: UserOut = Depends(get_current_user)
+) -> StreamingResponse:
     """按 SSE 逐段返回模型的文字。全部片段到齐后，仍把双方的话一次写入数据库。"""
     with Session(engine) as session:
         history = session.scalars(
@@ -681,8 +712,16 @@ def chat(body: ChatCreate, user: UserOut = Depends(get_current_user)) -> Streami
             return
         now = datetime.now(timezone.utc)
         with Session(engine) as session:
-            session.add(Message(user_id=user.id, role="user", content=body.content, created_at=now))
-            session.add(Message(user_id=user.id, role="assistant", content=reply, created_at=now))
+            session.add(
+                Message(
+                    user_id=user.id, role="user", content=body.content, created_at=now
+                )
+            )
+            session.add(
+                Message(
+                    user_id=user.id, role="assistant", content=reply, created_at=now
+                )
+            )
             session.commit()
 
     return StreamingResponse(events(), media_type="text/event-stream")
@@ -743,12 +782,16 @@ def _parse_qc(description: str) -> tuple[QcResult, int, int, int]:
     try:
         result = QcResult.model_validate_json(content)
     except ValidationError as exc:
-        raise HTTPException(status_code=502, detail="模型返回的 JSON 不符合质控结构") from exc
+        raise HTTPException(
+            status_code=502, detail="模型返回的 JSON 不符合质控结构"
+        ) from exc
     return result, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
 
 
 @app.post("/qc-reports", status_code=201)
-def create_qc_report(body: QcCreate, user: UserOut = Depends(get_current_user)) -> QcOut:
+def create_qc_report(
+    body: QcCreate, user: UserOut = Depends(get_current_user)
+) -> QcOut:
     """解析质控描述并保存。token 用量和 JSON 字段一起写入数据库。"""
     result, prompt_tokens, completion_tokens, total_tokens = _parse_qc(body.description)
     record = QcReport(
@@ -846,7 +889,9 @@ def _ask_about_qc(content: str, user_id: int) -> tuple[str, QcCount]:
 
 
 @app.post("/questions")
-def ask_question(body: QuestionCreate, user: UserOut = Depends(get_current_user)) -> QuestionOut:
+def ask_question(
+    body: QuestionCreate, user: UserOut = Depends(get_current_user)
+) -> QuestionOut:
     """回答质控数量问题。响应里的数字来自数据库，不由模型编造。"""
     answer, count = _ask_about_qc(body.content, user.id)
     return QuestionOut(
@@ -869,7 +914,9 @@ def _summarize_measurements(values: list[float], threshold: float) -> MetricStat
     )
 
 
-def _ask_about_metrics(content: str, values: list[float], threshold: float) -> tuple[str, MetricStats]:
+def _ask_about_metrics(
+    content: str, values: list[float], threshold: float
+) -> tuple[str, MetricStats]:
     """先让模型调用计算工具。pandas 失败时直接返回错误，不再生成文字。"""
     messages: list[ChatCompletionMessageParam] = [
         {"role": "system", "content": METRIC_PROMPT},
@@ -879,7 +926,10 @@ def _ask_about_metrics(content: str, values: list[float], threshold: float) -> t
         model=_model_setting("OPENAI_MODEL"),
         messages=messages,
         tools=[METRIC_TOOL],
-        tool_choice={"type": "function", "function": {"name": "summarize_measurements"}},
+        tool_choice={
+            "type": "function",
+            "function": {"name": "summarize_measurements"},
+        },
         extra_body={"thinking": {"type": "disabled"}},
     )
     tool_calls = first.choices[0].message.tool_calls
@@ -922,13 +972,17 @@ def _ask_about_metrics(content: str, values: list[float], threshold: float) -> t
 
 
 @app.post("/metrics")
-def ask_metrics(body: MetricCreate, user: UserOut = Depends(get_current_user)) -> MetricOut:
+def ask_metrics(
+    body: MetricCreate, user: UserOut = Depends(get_current_user)
+) -> MetricOut:
     """根据 pandas 的计算结果回答。计算失败时不会让模型编造数字。"""
     answer, stats = _ask_about_metrics(body.content, body.values, body.threshold)
     return MetricOut(answer=answer, mean=stats.mean, anomaly_count=stats.anomaly_count)
 
 
-def _split_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> list[str]:
+def _split_text(
+    text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP
+) -> list[str]:
     """按固定长度切块，相邻块保留一段重叠。"""
     chunks: list[str] = []
     start = 0
@@ -986,7 +1040,9 @@ def _load_chunks(session: Session, document_id: int, user_id: int) -> list[Chunk
 
 
 @app.post("/documents", status_code=201)
-def create_document(body: DocumentCreate, user: UserOut = Depends(get_current_user)) -> DocumentOut:
+def create_document(
+    body: DocumentCreate, user: UserOut = Depends(get_current_user)
+) -> DocumentOut:
     """切分正文，生成向量，并和文本块一起写入数据库。"""
     pieces = _split_text(body.content)
     if not pieces:
@@ -1068,36 +1124,97 @@ def _search_chunks(user_id: int, question: str) -> list[CitationOut]:
     return [citation for _, citation in ranked[:RETRIEVAL_LIMIT]]
 
 
-def _ask_with_citations(question: str, citations: list[CitationOut]) -> str:
-    """把检索到的原文交给模型，由模型写成回答。"""
-    excerpts = "\n".join(f"[{index}] {item.content}" for index, item in enumerate(citations, start=1))
-    messages: list[ChatCompletionMessageParam] = [
+def _knowledge_messages(
+    question: str, citations: list[CitationOut]
+) -> list[ChatCompletionMessageParam]:
+    """把检索到的原文和问题组成发给模型的消息。"""
+    excerpts = "\n".join(
+        f"[{index}] {item.content}" for index, item in enumerate(citations, start=1)
+    )
+    return [
         {"role": "system", "content": KNOWLEDGE_PROMPT},
         {"role": "user", "content": f"原文：\n{excerpts}\n\n问题：{question}"},
     ]
-    return _ask_model(messages)
+
+
+def _ask_with_citations(question: str, citations: list[CitationOut]) -> str:
+    """把检索到的原文交给模型，由模型写成回答。"""
+    return _ask_model(_knowledge_messages(question, citations))
 
 
 @app.post("/answers")
-def answer_from_documents(body: AnswerCreate, user: UserOut = Depends(get_current_user)) -> AnswerOut:
+def answer_from_documents(
+    body: AnswerCreate, user: UserOut = Depends(get_current_user)
+) -> AnswerOut:
     """用当前用户的文档回答。没有足够相似的原文时，不调用模型，直接回答不知道。"""
     citations = _search_chunks(user.id, body.content)
     if not citations:
         return AnswerOut(answer="不知道", citations=[])
-    return AnswerOut(answer=_ask_with_citations(body.content, citations), citations=citations)
+    return AnswerOut(
+        answer=_ask_with_citations(body.content, citations), citations=citations
+    )
+
+
+@app.post("/answers/stream")
+def stream_answer(
+    body: AnswerCreate, user: UserOut = Depends(get_current_user)
+) -> StreamingResponse:
+    """先返回引用的原文，再逐段返回回答。没有依据时只返回不知道。"""
+    citations = _search_chunks(user.id, body.content)
+    messages = _knowledge_messages(body.content, citations) if citations else None
+
+    def events():
+        yield f"event: citations\ndata: {json.dumps([item.model_dump() for item in citations], ensure_ascii=False)}\n\n"
+        if messages is None:
+            yield f"event: delta\ndata: {json.dumps('不知道', ensure_ascii=False)}\n\n"
+            return
+        for delta in _stream_model(messages):
+            yield f"event: delta\ndata: {json.dumps(delta, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 GOLD_DOCUMENTS: list[tuple[str, str]] = [
-    ("样本接收", "收到样本后先核对编号和送检单是否一致。编号不一致时停止检测，并记录异常原因。核对完成后把样本交给检测岗位。交接时双方在接收记录上签名，并注明接收时间。"),
-    ("样本保存", "全血样本放在 2 到 8 摄氏度冷藏，不要冷冻。保存时间不超过 24 小时。超时样本需要重新采集。冷藏箱温度每天记录两次，超出范围时转移样本并上报。"),
-    ("试剂准备", "试剂使用前从冷藏取出，恢复到室温后再打开。不同批号的试剂不要混用。开瓶时间写在瓶身标签上。开瓶后的试剂按说明书期限使用，过期试剂不得继续检测。"),
-    ("仪器校准", "每天开机后先做空白校准，空白通过后才能检测样本。校准失败时停止上机，并通知设备管理员。管理员排除故障前，不得改用备用参数继续检测。"),
-    ("室内质控", "每批检测都要加入阴性质控和阳性质控。质控未通过时，该批样本结果不得发出。质控图上的点超出规则时，先查找原因，再决定是否复测。"),
-    ("结果复核", "超出参考范围的结果由另一名人员复核。复核人与检测人不能是同一人。复核意见写入原始记录。复核不同意时，结果保持未发布，直到重新检测完成。"),
-    ("废弃处理", "使用过的针头放入利器盒，不得丢进生活垃圾桶。利器盒装到三分之二时封口，按医疗废物交接。交接单上写明数量和日期，生活垃圾通道不能接收利器盒。"),
-    ("报告发放", "报告经审核人签字后才能发放。未签字的报告不得告诉受检者结果。发放时核对受检者姓名和样本编号。电话告知结果同样要先完成审核，并留下告知记录。"),
-    ("生物安全", "实验操作戴手套和口罩。发生样本溅出时，先覆盖消毒，再清理台面，并记录事件。消毒接触时间按消毒液说明书执行，未处理完不得继续检测下一批。"),
-    ("记录归档", "原始记录当天归档，保存期限按实验室规定执行。记录不得涂改，写错时划改并签名。归档后借出记录要登记归还日期，缺页记录不能入库。"),
+    (
+        "样本接收",
+        "收到样本后先核对编号和送检单是否一致。编号不一致时停止检测，并记录异常原因。核对完成后把样本交给检测岗位。交接时双方在接收记录上签名，并注明接收时间。",
+    ),
+    (
+        "样本保存",
+        "全血样本放在 2 到 8 摄氏度冷藏，不要冷冻。保存时间不超过 24 小时。超时样本需要重新采集。冷藏箱温度每天记录两次，超出范围时转移样本并上报。",
+    ),
+    (
+        "试剂准备",
+        "试剂使用前从冷藏取出，恢复到室温后再打开。不同批号的试剂不要混用。开瓶时间写在瓶身标签上。开瓶后的试剂按说明书期限使用，过期试剂不得继续检测。",
+    ),
+    (
+        "仪器校准",
+        "每天开机后先做空白校准，空白通过后才能检测样本。校准失败时停止上机，并通知设备管理员。管理员排除故障前，不得改用备用参数继续检测。",
+    ),
+    (
+        "室内质控",
+        "每批检测都要加入阴性质控和阳性质控。质控未通过时，该批样本结果不得发出。质控图上的点超出规则时，先查找原因，再决定是否复测。",
+    ),
+    (
+        "结果复核",
+        "超出参考范围的结果由另一名人员复核。复核人与检测人不能是同一人。复核意见写入原始记录。复核不同意时，结果保持未发布，直到重新检测完成。",
+    ),
+    (
+        "废弃处理",
+        "使用过的针头放入利器盒，不得丢进生活垃圾桶。利器盒装到三分之二时封口，按医疗废物交接。交接单上写明数量和日期，生活垃圾通道不能接收利器盒。",
+    ),
+    (
+        "报告发放",
+        "报告经审核人签字后才能发放。未签字的报告不得告诉受检者结果。发放时核对受检者姓名和样本编号。电话告知结果同样要先完成审核，并留下告知记录。",
+    ),
+    (
+        "生物安全",
+        "实验操作戴手套和口罩。发生样本溅出时，先覆盖消毒，再清理台面，并记录事件。消毒接触时间按消毒液说明书执行，未处理完不得继续检测下一批。",
+    ),
+    (
+        "记录归档",
+        "原始记录当天归档，保存期限按实验室规定执行。记录不得涂改，写错时划改并签名。归档后借出记录要登记归还日期，缺页记录不能入库。",
+    ),
 ]
 
 GOLD_QUESTIONS: list[tuple[str, str]] = [
@@ -1173,7 +1290,9 @@ def _evaluate_retrieval(
     return items
 
 
-def _chunk_run(chunk_size: int, chunk_overlap: int, items: list[EvaluationItemOut]) -> ChunkRunOut:
+def _chunk_run(
+    chunk_size: int, chunk_overlap: int, items: list[EvaluationItemOut]
+) -> ChunkRunOut:
     """把一种切块设置的结果收成命中率。"""
     hit_count = sum(1 for item in items if item.hit)
     total = len(items)
@@ -1188,7 +1307,9 @@ def _chunk_run(chunk_size: int, chunk_overlap: int, items: list[EvaluationItemOu
 
 def _to_evaluation(record: Evaluation) -> EvaluationOut:
     """把一次评测记录转成接口响应。"""
-    items = [EvaluationItemOut.model_validate(item) for item in json.loads(record.detail)]
+    items = [
+        EvaluationItemOut.model_validate(item) for item in json.loads(record.detail)
+    ]
     return EvaluationOut(
         id=record.id,
         total=record.total,
@@ -1211,7 +1332,9 @@ def create_evaluation(user: UserOut = Depends(get_current_user)) -> EvaluationOu
             total=total,
             hit_count=hit_count,
             hit_rate=round(hit_count / total, 2),
-            detail=json.dumps([item.model_dump() for item in items], ensure_ascii=False),
+            detail=json.dumps(
+                [item.model_dump() for item in items], ensure_ascii=False
+            ),
             created_at=now,
         )
         session.add(record)
@@ -1225,14 +1348,18 @@ def list_evaluations(user: UserOut = Depends(get_current_user)) -> list[Evaluati
     """返回当前用户做过的评测。重启服务后仍然在。"""
     with Session(engine) as session:
         records = session.scalars(
-            select(Evaluation).where(Evaluation.user_id == user.id).order_by(Evaluation.id)
+            select(Evaluation)
+            .where(Evaluation.user_id == user.id)
+            .order_by(Evaluation.id)
         ).all()
         return [_to_evaluation(record) for record in records]
 
 
 def _to_comparison(record: EvaluationComparison) -> EvaluationComparisonOut:
     """把一次切块对比转成接口响应。"""
-    misses = [EvaluationItemOut.model_validate(item) for item in json.loads(record.detail)]
+    misses = [
+        EvaluationItemOut.model_validate(item) for item in json.loads(record.detail)
+    ]
     return EvaluationComparisonOut(
         id=record.id,
         before=ChunkRunOut(
@@ -1254,10 +1381,14 @@ def _to_comparison(record: EvaluationComparison) -> EvaluationComparisonOut:
 
 
 @app.post("/evaluation-comparisons", status_code=201)
-def create_evaluation_comparison(user: UserOut = Depends(get_current_user)) -> EvaluationComparisonOut:
+def create_evaluation_comparison(
+    user: UserOut = Depends(get_current_user),
+) -> EvaluationComparisonOut:
     """用原来的切块和改短后的切块各测一遍，两次命中率一起保存。"""
     before_items = _evaluate_retrieval(require_top=True)
-    after_items = _evaluate_retrieval(ADJUSTED_CHUNK_SIZE, ADJUSTED_CHUNK_OVERLAP, require_top=True)
+    after_items = _evaluate_retrieval(
+        ADJUSTED_CHUNK_SIZE, ADJUSTED_CHUNK_OVERLAP, require_top=True
+    )
     before = _chunk_run(CHUNK_SIZE, CHUNK_OVERLAP, before_items)
     after = _chunk_run(ADJUSTED_CHUNK_SIZE, ADJUSTED_CHUNK_OVERLAP, after_items)
     misses = [item for item in after_items if not item.hit]
@@ -1273,7 +1404,9 @@ def create_evaluation_comparison(user: UserOut = Depends(get_current_user)) -> E
             after_chunk_overlap=after.chunk_overlap,
             after_hit_count=after.hit_count,
             after_hit_rate=after.hit_rate,
-            detail=json.dumps([item.model_dump() for item in misses], ensure_ascii=False),
+            detail=json.dumps(
+                [item.model_dump() for item in misses], ensure_ascii=False
+            ),
             created_at=now,
         )
         session.add(record)
@@ -1283,7 +1416,9 @@ def create_evaluation_comparison(user: UserOut = Depends(get_current_user)) -> E
 
 
 @app.get("/evaluation-comparisons")
-def list_evaluation_comparisons(user: UserOut = Depends(get_current_user)) -> list[EvaluationComparisonOut]:
+def list_evaluation_comparisons(
+    user: UserOut = Depends(get_current_user),
+) -> list[EvaluationComparisonOut]:
     """返回当前用户的切块对比。重启服务后仍然在。"""
     with Session(engine) as session:
         records = session.scalars(
@@ -1292,3 +1427,12 @@ def list_evaluation_comparisons(user: UserOut = Depends(get_current_user)) -> li
             .order_by(EvaluationComparison.id)
         ).all()
         return [_to_comparison(record) for record in records]
+
+
+app.mount(
+    "/ui",
+    StaticFiles(
+        directory=Path(__file__).resolve().parent.parent / "web" / "dist", html=True
+    ),
+    name="ui",
+)
